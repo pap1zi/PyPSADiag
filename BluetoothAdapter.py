@@ -16,66 +16,42 @@ import re
 import sys
 import threading
 import time
-import serial
-import serial.tools.list_ports
+from typing import Optional
 
+from BluetoothSocketSerial import (
+    BluetoothSocketSerial,
+    discover_bluetooth_devices,
+    parse_mac_and_channel,
+    SerialException,
+    SerialTimeoutException,
+)
+
+try:
+    import serial
+    _SerialException = serial.SerialException
+    _SerialTimeoutException = serial.SerialTimeoutException
+except ImportError:
+    serial = None  # type: ignore
+    _SerialException = SerialException
+    _SerialTimeoutException = SerialTimeoutException
 
 IS_WINDOWS = sys.platform == "win32"
 
-_POSIX_PORT_BLACKLIST = (
-    "bluetooth-incoming-port",
-    "bluetooth-modem",
-    "debug-console",
-    "wlan-debug",
-)
-
-_POSIX_USB_MARKERS = (
-    "usbserial", "usbmodem", "slab_", "wchusbserial", "ftdi", "ttyusb", "ttyacm",
-)
-
-
-def _is_rfcomm_device(device: str) -> bool:
-    if IS_WINDOWS or not device:
-        return False
-    leaf = device.rsplit("/", 1)[-1].lower()
-    return device.startswith("/dev/cu.") and \
-        not any(m in leaf for m in _POSIX_USB_MARKERS)
-
-
-def _natural_com_key(name: str):
-    m = re.search(r"\d+", name or "")
-    return (int(m.group()) if m else 0, name or "")
-
-
-def _is_bluetooth_port(port) -> bool:
-    if IS_WINDOWS:
-        return "BTHENUM" in (port.hwid or "").upper() or \
-               "BLUETOOTH" in (port.description or "").upper()
-
-    device = port.device or ""
-    if not device.startswith("/dev/cu."):
-        return False
-    leaf = device[len("/dev/cu."):].lower()
-    return not any(bad in leaf for bad in _POSIX_PORT_BLACKLIST)
-
 
 class BluetoothAdapter:
-    BAUD_RATES = [115200, 57600, 38400, 19200, 9600, 230400]
-    POSIX_NOMINAL_BAUD = 115200
-
     AT_ST_NATIVE = "40"
     AT_ST_NORMAL = "30"
 
     def __init__(self, logger=None, isotp_mode=None, debug_timing=None, **kwargs):
         self.logger = logger
-        self.serialPort = serial.Serial()
+        self.serialPort = BluetoothSocketSerial()
         self.connected = False
         self.configured = False
         self.current_tx_id = ""
         self.current_rx_id = ""
         self.current_protocol = "uds"
         self.elm_version = ""
-        self.detected_baud = None
+        self.detected_baud = 115200
         self._raw_can_supported = True
         self._multiframe_incomplete = False
         self._exit_hook_armed = False
@@ -125,164 +101,55 @@ class BluetoothAdapter:
 
     def fillPortNameCombobox(self, combobox):
         combobox.clear()
-        comPorts = serial.tools.list_ports.comports()
+        self.log("Discovering Bluetooth devices via bluetoothctl...", ui=True)
+        devices = discover_bluetooth_devices()
+        self.log(f"Found {len(devices)} Bluetooth device(s)", ui=True)
 
-        bt_ports = []
-        other_ports = []
+        for mac, name in devices:
+            label = f"{name} [{mac}]"
+            combobox.addItem(label, mac)
+            self.log(f"  Found device: {label}", ui=True)
 
-        for port in comPorts:
-            if not IS_WINDOWS and (port.device or "").startswith("/dev/tty."):
-                continue
-
-            if _is_bluetooth_port(port):
-                bt_ports.append(port)
-            else:
-                other_ports.append(port)
-
-        bt_ports.sort(key=lambda p: _natural_com_key(p.device))
-        other_ports.sort(key=lambda p: _natural_com_key(p.device))
-
-        self.log(f"Found {len(bt_ports)} Bluetooth port(s), "
-                 f"{len(other_ports)} other port(s)", ui=True)
-
-        for port in bt_ports:
-            self.log(f"Scanning {port.device} ({port.description})...", ui=True)
-            baud, version = self._probe_elm327(port.device)
-            if baud:
-                label = f"{port.device} - ELM327 [{version}] @ {baud} baud"
-                combobox.addItem(label, f"{port.device}:{baud}")
-                self.log(f"  Found ELM327: {version} @ {baud}", ui=True)
-            else:
-                label = f"{port.device} - {port.description or 'Bluetooth'} (no response)"
-                combobox.addItem(label, f"{port.device}:0")
-                self.log(f"  No ELM327 response", ui=True)
-
-        for port in other_ports:
-            label = f"{port.device} - {port.description or 'Unknown'}"
-            combobox.addItem(label, f"{port.device}:0")
-
-    def _probe_elm327(self, port_name):
-        bauds = [self.POSIX_NOMINAL_BAUD] if _is_rfcomm_device(port_name) \
-            else self.BAUD_RATES
-
-        for baud in bauds:
-            test_port = serial.Serial()
-            test_port.port = port_name
-            test_port.baudrate = baud
-            test_port.timeout = 1.5
-            test_port.write_timeout = 3.0
-            try:
-                test_port.open()
-                time.sleep(0.3)
-                test_port.reset_input_buffer()
-
-                test_port.write(b"ATZ\r")
-                if IS_WINDOWS:
-                    test_port.flush()
-
-                data = bytearray()
-                end = time.monotonic() + 3.0
-                while time.monotonic() < end:
-                    n = test_port.in_waiting
-                    if n:
-                        data.extend(test_port.read(n))
-                        if b">" in data:
-                            break
-                    else:
-                        time.sleep(0.01)
-
-                if data:
-                    response = data.decode("utf-8", errors="ignore")
-                    if "ELM" in response.upper():
-                        for line in response.split("\r"):
-                            line = line.strip()
-                            if "ELM" in line.upper():
-                                return baud, line
-                        return baud, "ELM327"
-
-            except (serial.SerialException, OSError) as e:
-                self.log(f"  probe {port_name}@{baud} failed: {e}")
-            finally:
-                try:
-                    if test_port.is_open:
-                        test_port.close()
-                except Exception:
-                    pass
-
-        return None, None
+        if not devices:
+            self.log("No paired/detected Bluetooth devices found. You can enter MAC manually (XX:XX:XX:XX:XX:XX)", ui=True)
+            combobox.addItem("Enter MAC address manually (e.g. 00:1D:A5:68:98:8B)", "")
 
     def open(self, portNr, baudRate=None):
         try:
-            detected_baud = None
-            if isinstance(portNr, str) and portNr.rsplit(":", 1)[-1].isdigit() \
-                    and ":" in portNr:
-                head, baud_str = portNr.rsplit(":", 1)
-                if head:
-                    portNr = head
-                    if int(baud_str) > 0:
-                        detected_baud = int(baud_str)
+            target_str = str(portNr or "").strip()
+            mac, channel = parse_mac_and_channel(target_str)
+            if not mac:
+                return f"Invalid Bluetooth MAC address: {portNr!r}. Expected format: XX:XX:XX:XX:XX:XX"
 
-            self.serialPort.port = portNr
-            self.serialPort.timeout = 3.0
-            self.serialPort.write_timeout = 5.0
+            self.log(f"Opening Bluetooth RFCOMM socket to {mac} (channel {channel})...", ui=True)
+            self.serialPort = BluetoothSocketSerial(
+                port=mac,
+                channel=channel,
+                timeout=3.0,
+                write_timeout=5.0
+            )
 
-            if _is_rfcomm_device(portNr):
-                baud = detected_baud or self.POSIX_NOMINAL_BAUD
-                self.log(f"Connecting to {portNr} (RFCOMM, line speed ignored)", ui=True)
-                self.serialPort.baudrate = baud
+            try:
                 self.serialPort.open()
-                time.sleep(0.5)
+            except (SerialException, _SerialException) as e:
+                self.log(f"Failed to connect to Bluetooth socket: {e}", ui=True)
+                return str(e)
 
-                if self._init_elm327():
-                    self.connected = True
-                    self.detected_baud = baud
-                    self._arm_exit_cleanup()
-                    self._start_keep_alive()
-                    return ""
-                self.serialPort.close()
-                return "ELM327 not responding on " + portNr
+            time.sleep(0.3)
 
-            if detected_baud:
-                self.log(f"Connecting to {portNr} @ {detected_baud} baud (auto-detected)", ui=True)
-                self.serialPort.baudrate = detected_baud
-                self.serialPort.open()
-                time.sleep(0.5)
+            if self._init_elm327():
+                self.connected = True
+                self.detected_baud = 115200
+                self._arm_exit_cleanup()
+                self._start_keep_alive()
+                self.log(f"Connected to ELM327 over Bluetooth RFCOMM socket ({mac})", ui=True)
+                return ""
 
-                if self._init_elm327():
-                    self.connected = True
-                    self.detected_baud = detected_baud
-                    self._arm_exit_cleanup()
-                    self._start_keep_alive()
-                    return ""
-                self.serialPort.close()
+            self.serialPort.close()
+            return f"ELM327 not responding on {mac}"
 
-            self.log(f"Auto-detecting baud rate on {portNr}...", ui=True)
-            for baud in self.BAUD_RATES:
-                try:
-                    self.log(f"  Trying {baud} baud...", ui=True)
-                    self.serialPort.baudrate = baud
-                    if not self.serialPort.is_open:
-                        self.serialPort.open()
-                    time.sleep(0.3)
-
-                    if self._init_elm327():
-                        self.connected = True
-                        self.detected_baud = baud
-                        self.log(f"Connected @ {baud} baud", ui=True)
-                        self._arm_exit_cleanup()
-                        self._start_keep_alive()
-                        return ""
-
-                    self.serialPort.close()
-                except serial.SerialException:
-                    if self.serialPort.is_open:
-                        self.serialPort.close()
-                    continue
-
-            return "ELM327 not found: no response at any baud rate"
-
-        except serial.SerialException as e:
-            return f"Error opening Bluetooth port: {str(e)}"
+        except Exception as e:
+            return f"Error opening Bluetooth socket: {str(e)}"
 
     def _arm_exit_cleanup(self):
         if IS_WINDOWS or self._exit_hook_armed:
@@ -565,7 +432,7 @@ class BluetoothAdapter:
                              f"{response!r}", ui=True)
                 return parsed
 
-            except serial.SerialTimeoutException:
+            except _SerialTimeoutException:
                 self.log(f"Write timeout for {data} (BT link stalled)")
                 return "Timeout"
             except Exception as e:
@@ -1010,7 +877,7 @@ class BluetoothAdapter:
                     self._send_keep_alive_frame("3E80")
                 else:
                     self._send_at("ATI")
-            except serial.SerialTimeoutException:
+            except _SerialTimeoutException:
                 self.log("Keep-alive: write timeout (link may be dead)")
             except Exception as e:
                 self.log(f"Keep-alive tick error (ignored): {e}")
@@ -1028,17 +895,19 @@ class BluetoothAdapter:
             self._drain_input()
             self._write_line(frame)
             self._read_elm_response(timeout=1.5)
-        except serial.SerialTimeoutException:
+        except _SerialTimeoutException:
             raise
 
     def get_adapter_info(self):
         return {
-            "name": "ELM327 Bluetooth OBD",
-            "type": "Bluetooth",
+            "name": "ELM327 Bluetooth OBD (RFCOMM Socket)",
+            "type": "Bluetooth (RFCOMM Socket)",
             "connected": self.connected,
             "configured": self.configured,
             "elm_version": self.elm_version,
             "isotp_mode": self.isotp_mode,
             "tx_id": self.current_tx_id,
             "rx_id": self.current_rx_id,
+            "port": getattr(self.serialPort, 'port', ''),
         }
+

@@ -464,13 +464,14 @@ class MainWindow(QMainWindow):
     def changeDiagtoolType(self, index):
         self.diagtool_type = self.ui.diagtoolTypeComboBox.itemData(index)
         if self.diagtool_type.lower() == "serial" or self.diagtool_type.lower() == "bluetooth":
-            # Arduino and Bluetooth both use COM port selection
+            is_bt = self.diagtool_type.lower() == "bluetooth"
             self.ui.portNameComboBox.setEnabled(True)
+            self.ui.portNameComboBox.setEditable(is_bt)
             self.ui.SearchConnectPort.setEnabled(True)
             self.ui.portNameComboBox.setVisible(True)
             self.ui.canPinsComboBox.setVisible(False)
             self.ui.wsIpInput.setVisible(False)
-            if self.ui.portNameComboBox.count() > 0:
+            if self.ui.portNameComboBox.count() > 0 or is_bt:
                 self.ui.ConnectPort.setEnabled(True)
             else:
                 self.ui.ConnectPort.setEnabled(False)
@@ -1181,19 +1182,18 @@ class MainWindow(QMainWindow):
         if not self.serialController.isOpen():
             self.writeToOutputView(
                 "[PinExtractor] Connect to OBD via PyPSADiag main window first "
-                "(serial mode, ELM327 adapter on COM port).")
+                "(serial or Bluetooth ELM327 adapter).")
             return
 
         # The dialog borrows the raw pyserial.Serial held by the SerialPort
-        # transport.  VCI / Bluetooth / WebSocket modes don't expose a raw
-        # serial object, so we bail out cleanly if that's the case.
+        # or BluetoothSocketSerial transport. VCI / WebSocket modes don't
+        # expose a raw serial object, so we bail out cleanly if that's the case.
         transport = getattr(self.serialController, 'transport', None)
         raw_serial = getattr(transport, 'serialPort', None)
         if raw_serial is None or not hasattr(raw_serial, 'is_open'):
             self.writeToOutputView(
-                "[PinExtractor] Requires a serial-port connection (Arduino "
-                "or raw ELM327 adapter on COM port).  Current transport "
-                "does not expose a raw serial object.")
+                "[PinExtractor] Requires a serial or Bluetooth ELM327 connection. "
+                "Current transport does not expose a raw serial object.")
             return
 
         # The sniffer drives raw_serial directly (ATMA monitor mode) and does
